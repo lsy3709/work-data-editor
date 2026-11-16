@@ -1,0 +1,14 @@
+# 가상 환경
+.venv/
+venv/
+# 파이썬이 만드는 임시 파일
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+# 연습하면서 바뀌는 것 (python reset_samples.py 로 다시 만든다)
+samples/
+백업/
+*_내보내기.xlsx
+# 엑셀 · Access 가 파일을 열 때 만드는 임시 파일
+~$*
+*.laccdb
