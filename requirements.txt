@@ -1,4 +1,6 @@
 openpyxl
 pyodbc
 pandas
+scikit-learn
+matplotlib
 ipykernel

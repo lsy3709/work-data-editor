@@ -146,6 +146,102 @@ class 엑셀(Base):
         self.assertEqual(ws.cell(n0 + 2, col).number_format, "#,##0")   # 윗줄 서식 이어받음
 
 
+class 메모리(Base):
+    def test_원본은_고친_행만_따로_보관(self):
+        _, _, s = self.open("보금자리론_신청_2026_10.xlsx")
+        self.assertEqual(s.kept_originals(), 0)            # 열기만 하면 사본을 만들지 않는다
+        ids = s.ids()
+        before = s.get(ids[0], "처리상태")
+        s.set_cell(ids[0], "처리상태", "검토완료")
+        s.set_cell(ids[0], "신청금액(만원)", "1")
+        self.assertEqual(s.kept_originals(), 1)            # 같은 행을 두 번 고쳐도 한 번만
+        self.assertEqual(s.original_row(ids[0])[s.col("처리상태")], before)
+        s.delete_rows([ids[5]])
+        self.assertEqual(s.kept_originals(), 2)
+        d = s.diff()
+        self.assertEqual((len(d["updated"]), len(d["deleted"]), len(d["added"])), (2, 1, 0))
+        self.assertEqual(s.status(ids[0]), "changed")
+        self.assertEqual(s.status(ids[1]), "")
+        s.undo(); s.undo(); s.undo()
+        self.assertEqual(s.change_count(), 0)
+        self.assertEqual(s.status(ids[0]), "")
+
+    def test_기준열은_고치기_전_값으로_찾는다(self):
+        _, _, s = self.open("보금자리론_신청_2026_10.xlsx")
+        s.set_cell(s.ids()[0], "신청번호", s.get(s.ids()[1], "신청번호"))   # 화면에서는 겹치게 고쳤지만
+        self.assertEqual(ed.find_key(s), "신청번호")                        # 원본 기준으로는 여전히 고유
+        self.assertEqual(len(list(s.original_values("신청번호"))), 240)
+
+    def test_되돌리기_기록은_한도까지만(self):
+        _, _, s = self.open("보금자리론_신청_2026_10.xlsx")
+        rid = s.ids()[0]
+        for i in range(ed.UNDO_LIMIT + 50):
+            s.set_cell(rid, "신청금액(만원)", str(i + 1))
+        n = 0
+        while s.undo():
+            n += 1
+        self.assertEqual(n, ed.UNDO_LIMIT)
+
+
+class 백그라운드작업(Base):
+    def wait(self, jobs, seconds=30):
+        import time
+        end = time.time() + seconds
+        while jobs.pending and time.time() < end:
+            jobs.poll()
+            time.sleep(0.005)
+        self.assertEqual(jobs.pending, 0, "작업이 제때 끝나지 않음")
+
+    def test_결과는_부른_쪽_스레드에서_받는다(self):
+        import threading
+        jobs = ed.Jobs()
+        seen = {}
+
+        def work():
+            seen["work"] = threading.get_ident()
+            return 42
+
+        def done(result, error):
+            seen["done"] = threading.get_ident()
+            seen["result"], seen["error"] = result, error
+
+        jobs.start(work, done)
+        self.assertEqual(jobs.pending, 1)
+        self.wait(jobs)
+        self.assertEqual((seen["result"], seen["error"]), (42, None))
+        self.assertNotEqual(seen["work"], threading.get_ident())   # 일은 다른 스레드에서
+        self.assertEqual(seen["done"], threading.get_ident())      # 결과 처리는 부른 스레드에서
+
+    def test_오류도_결과처럼_전달된다(self):
+        jobs = ed.Jobs()
+        got = []
+        jobs.start(lambda: ed.open_source(self.tmp / "없는파일.xlsx"), lambda r, e: got.append((r, e)))
+        self.wait(jobs)
+        self.assertIsNone(got[0][0])
+        self.assertIsInstance(got[0][1], ValueError)
+
+    def test_여러_파일을_동시에_읽어도_결과가_같다(self):
+        names = ["보금자리론_신청_2026_10.xlsx", "S1_보금자리론_취합.xlsx", "2026_10_부산지사.xlsx"]
+        if has_access():
+            names.append("업무DB.accdb")
+        names = names * 3                                           # 같은 파일도 여러 스레드가 함께 읽는다
+
+        def read(name):
+            src = ed.open_source(self.tmp / name)
+            return list(src.load(src.tables()[0]).rows.values())
+
+        expected = {name: read(name) for name in set(names)}
+        jobs = ed.Jobs()
+        got = []
+        for name in names:
+            jobs.start(lambda n=name: (n, read(n)), lambda r, e: got.append((r, e)))
+        self.wait(jobs, 60)
+        self.assertEqual(len(got), len(names))
+        for result, error in got:
+            self.assertIsNone(error)
+            self.assertEqual(result[1], expected[result[0]])
+
+
 @unittest.skipUnless(has_access(), "pyodbc 또는 Access 드라이버 없음")
 class 액세스(Base):
     def test_읽기_수정_저장(self):
