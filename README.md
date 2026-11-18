@@ -329,6 +329,10 @@ GitHub 에서 [notebook_tutorial.ipynb](notebook_tutorial.ipynb) 를 누르면 �
 
 `pandas` · `scikit-learn` · `matplotlib` 이 필요하며([5번](#5-라이브러리-설치)), 없으면 설치 방법을 알려 주고 편집기는 그대로 쓸 수 있습니다.
 
+회귀 · 정제 · 이상 탐지 · t 검정 · 머신러닝이 **무엇이고 어디서 온 말인지**는 그림 12장과 함께 **[docs/concept_guide.md](docs/concept_guide.md)** (개념 사전: 역사 · 어원 · 개념 · 쓰이는 곳 · 용어 풀이)에 따로 적었습니다.
+
+![통계에서 머신러닝 · 딥러닝까지 200년의 연표](docs/figures/f11_timeline.png)
+
 ![분석 창 — 자동 분석 결과 요약](screenshots/a1_summary.png)
 
 ### 11-1. 화면 구성과 다섯 단계
@@ -562,6 +566,8 @@ st.figure_tests(c, tests, fit, exclude=o.mask).savefig("분석결과_검정.png"
 | `sample_report.py` | 연습용 표 네 개를 한 번에 분석해 `docs/sample_analysis.md` 와 그래프를 만듦 |
 | `docs/sample_analysis.md` | 연습용 표 분석 결과 (표마다 정제 · 검정 · 모델 비교 · 그래프) |
 | `docs/ml_guide.md` | 모델 소개(어원 · 역사 · 기능). `python analysis.py > docs/ml_guide.md` 로 다시 만듦 |
+| `docs/concept_guide.md` | 개념 사전: 회귀 · 정제 · 이상 탐지 · t 검정 · 머신러닝의 역사 · 어원 · 개념 · 쓰이는 곳, 그림 12장 |
+| `make_guide_figures.py` | 개념 사전의 그림 12장(`docs/figures/`)을 만드는 스크립트 |
 | `make_analysis_sample.py` | 분석 연습용 가상 데이터를 만드는 스크립트 |
 | `test_analysis.py` | 회귀 분석 테스트 17개 |
 | `test_stat_tests.py` | 통계 검정 · 정제 · 학습 곡선 테스트 13개 |
