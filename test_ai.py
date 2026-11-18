@@ -47,6 +47,56 @@ class 보내는내용(Base):
         with_rows = ac.describe(s, "신청내역", samples=3)
         self.assertIn(str(first[s.col("신청번호")]), with_rows)        # 켰을 때만 예시 행이 들어간다
 
+    def test_진단은_손볼_곳을_세어_주되_값은_담지_않는다(self):
+        p = self.pension()
+        d = ac.diagnose(p)
+        self.assertEqual((d["duplicates"], d["spaces"]), (2, 12))
+        looks = {name: info["looks"] for name, info in d["columns"].items()}
+        self.assertEqual((looks["월지급액"], looks["출생연도"], looks["가입일"]), ("number", "number", "date"))
+        self.assertIsNone(looks["가입번호"])                           # 'RM26-0001' 은 숫자가 아니다
+        text = ac.describe(p, "가입현황")
+        self.assertIn("숫자로 바꿀 수 있음", text)
+        self.assertIn("겹친 행 2개", text)
+        for row in list(p.rows.values())[:5]:                          # 진단을 넣어도 칸의 값은 나가지 않는다
+            self.assertNotIn(str(row[p.col("가입번호")]), text)
+            self.assertNotIn(str(row[p.col("월지급액")]).strip(), text)
+        self.assertEqual(p.change_count(), 0)                          # 진단은 표를 바꾸지 않는다
+        clean = ac.diagnose(self.loan())
+        self.assertEqual((clean["duplicates"], clean["spaces"]), (0, 0))
+        self.assertFalse(any(info["looks"] for info in clean["columns"].values()))
+
+    def test_번호나_코드는_숫자로_바꾸자고_하지_않는다(self):
+        cols = [ed.Column("고객번호", "str"), ed.Column("우편", "str"), ed.Column("금액", "str"), ed.Column("비고", "str")]
+        rows = [["1001", "04521", "1,200원", "확인"], ["1002", "06234", "3,400원", ""], ["1003", "13579", "560원", "보류"]]
+        s = ed.EditSession(cols, rows)
+        looks = {name: info["looks"] for name, info in ac.diagnose(s)["columns"].items()}
+        self.assertEqual(looks["우편"], "code")                         # 앞자리 0 이 사라지면 안 된다
+        self.assertEqual(looks["고객번호"], "code")                      # 이름이 '번호'인 열은 계산할 숫자가 아니다
+        self.assertEqual(looks["금액"], "number")
+        actions, notes = ac.suggest(s)
+        self.assertEqual([a["column"] for a in actions if a["op"] == "convert"], ["금액"])
+        self.assertTrue(any("우편" in n for n in notes) and any("고객번호" in n for n in notes))
+        self.assertIn("글자로 둘 것", ac.describe(s, "표"))
+
+    def test_AI_없이_만드는_기본_전처리(self):
+        p = self.pension()
+        actions, notes = ac.suggest(p)
+        self.assertEqual([a["op"] for a in actions], ["strip", "drop_duplicates", "convert", "convert", "convert", "fill_empty"])
+        self.assertTrue(any("관할지점" in n for n in notes))            # 글자 열의 빈칸은 지어내지 않고 알려만 준다
+        ac.run(p, actions)
+        self.assertEqual(len(p.rows), 60)
+        self.assertEqual([p.columns[p.col(n)].kind for n in ("월지급액", "출생연도", "가입일")], ["int", "int", "date"])
+        self.assertEqual(p.empty_count("월지급액"), 0)
+        self.assertEqual(ac.suggest(p)[0], [])                         # 한 번 하고 나면 더 할 것이 없다
+        p.undo()
+        self.assertEqual((len(p.rows), p.change_count()), (62, 0))
+        self.assertEqual(ac.suggest(self.loan()), ([], []))            # 깨끗한 표에는 제안이 없다
+
+    def test_막연한_요청도_되묻지_말라고_안내문에_적혀_있다(self):
+        prompt = ac.system_prompt(self.pension(), "가입현황")
+        self.assertIn("되묻지 말고", prompt)
+        self.assertIn("진단", prompt)
+
     def test_안내문에_쓸_수_있는_명령이_모두_적혀_있다(self):
         prompt = ac.system_prompt(self.loan(), "신청내역")
         for op in ac.OPS:

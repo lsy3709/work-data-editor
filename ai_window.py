@@ -18,11 +18,13 @@ from data_editor import FONT, TITLE
 HISTORY = 12            # AI 에게 다시 보내는 지난 대화 수 (너무 길어지지 않게)
 SAMPLES = 3             # '예시 값도 보내기'를 켰을 때 보내는 행 수
 HELLO = ("무엇을 할지 우리말로 적어 보세요. 예)\n"
+         "  · 전처리 해 줘  (프로그램이 표를 진단해서 AI 가 알아서 계획을 세웁니다)\n"
          "  · 지점코드가 X99 인 것을 ON1 로 바꿔 줘\n"
          "  · 신청금액이 3억 이상이고 반려된 건만 보여 줘\n"
          "  · 고객구분별 평균 신청금액을 알려 줘\n"
          "  · 월지급액을 숫자로 바꾸고 빈칸은 중앙값으로 채워 줘\n"
-         "표를 바꾸는 일은 아래 '적용할 내용'에 먼저 보여 드리고, [적용]을 눌러야 실행합니다.")
+         "표를 바꾸는 일은 아래 '적용할 내용'에 먼저 보여 드리고, [적용]을 눌러야 실행합니다.\n"
+         "키가 없으면 위의 [전처리 제안 (AI 없이)]을 눌러 보세요. 프로그램이 스스로 기본 전처리를 골라 줍니다.")
 
 
 class AIWindow:
@@ -88,6 +90,7 @@ class AIWindow:
         ttk.Checkbutton(row, variable=self.samples,
                         text=f"예시 값도 보내기 (열마다 값 예시와 앞 {SAMPLES}행 — 가짜 데이터일 때만 켜세요)").pack(side="left")
         ttk.Button(row, text="AI 에게 보내는 내용 보기", command=self.show_payload).pack(side="right")
+        ttk.Button(row, text="전처리 제안 (AI 없이)", command=self.suggest).pack(side="right", padx=6)
 
         bottom = ttk.Frame(self.win, padding=(10, 4, 10, 8))
         bottom.pack(side="bottom", fill="x")
@@ -258,10 +261,38 @@ class AIWindow:
         if not ac.changes_data(actions):             # 보기 · 정렬 · 집계는 표를 바꾸지 않으니 바로 한다
             self._run(actions)
             return
+        self._offer(actions, lines)
+
+    def _offer(self, actions, lines):
+        """표를 바꾸는 명령을 '적용할 내용'에 올려놓고 [적용]을 기다린다."""
         self.pending = actions
         self.last_lines = lines
         self._plan("\n".join(f"{n}. {line}" for n, line in enumerate(lines, 1)))
-        self._write("sys", "→ 아래 '적용할 내용'을 확인하고 [적용]을 누르세요.")
+        self._write("sys", f"→ 아직 실행하지 않았습니다. 아래 '적용할 내용' {len(lines)}가지를 확인하고 [적용]을 누르세요.")
+        self.apply_button.focus_set()
+
+    def suggest(self):
+        """AI 를 부르지 않고, 프로그램이 표를 진단해 기본 전처리를 골라 '적용할 내용'에 올린다. 올렸으면 True."""
+        if self.busy or self.session is None:
+            return False
+        self.pane.commit_edit()
+        if not self.pane.ready():
+            return False
+        if self.pending:
+            self.discard(say=False)
+        actions, notes = ac.suggest(self.session)
+        self._write("me", "나: [전처리 제안] — AI 없이 프로그램이 표를 살펴봅니다")
+        if not actions:
+            self._write("ai", "프로그램: 기본 전처리로 손볼 곳을 찾지 못했습니다 (앞뒤 빈칸 · 겹친 행 · 글자로 적힌 숫자와 날짜 · 숫자 열의 빈칸이 없음).")
+            for note in notes:
+                self._write("sys", note)
+            return False
+        self._write("ai", "프로그램: 표를 진단해 기본 전처리를 골랐습니다 — 앞뒤 빈칸 지우기 → 겹친 행 삭제 → 글자로 적힌 숫자 · 날짜 바꾸기 → 숫자 열 빈칸을 중앙값으로.")
+        for note in notes:
+            self._write("sys", note)
+        self._offer(actions, ac.preview(self.session, actions))
+        self.note = "프로그램이 AI 없이 기본 전처리 명령을 만들어 사용자에게 보여 주었다."
+        return True
 
     def apply(self):
         """미리 보여 준 명령을 실제로 실행한다."""

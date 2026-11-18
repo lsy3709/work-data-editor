@@ -6,7 +6,9 @@ AI 채팅의 가운데 부분 — AI 에게 무엇을 보낼지, 받은 답을 �
   2) AI 는 "무엇을 할지"를 정해진 명령(JSON)으로 답한다. 표를 직접 만지지 못한다.
   3) 프로그램이 그 명령을 내 PC 에서 실행한다. 실행 전에 미리 보여 주고, 실행 뒤에는 되돌릴 수 있다.
 
-    prompt = system_prompt(session, "신청내역")          # AI 에게 주는 안내문
+    diagnose(session)                                    # 손볼 곳 세기 (값 없이 개수와 판단만)
+    actions, notes = suggest(session)                    # AI 없이 만드는 기본 전처리 명령
+    prompt = system_prompt(session, "신청내역")          # AI 에게 주는 안내문 (표의 모양 + 진단)
     reply, actions = parse_reply(AI 의 답)               # 말 + 명령들
     lines = preview(session, actions)                    # 적용하면 어떻게 되는지 (표는 그대로)
     result = run(session, actions)                       # 실제로 적용 (한 번의 [되돌리기]로 돌아감)
@@ -38,12 +40,96 @@ class Result:
 # =====================================================================
 # 1. AI 에게 보내는 글
 # =====================================================================
+LOOKS = {"number": "값이 모두 숫자로 읽힘 → 숫자로 바꿀 수 있음", "date": "값이 모두 날짜로 읽힘 → 날짜로 바꿀 수 있음",
+         "code": "숫자처럼 보이지만 번호 · 코드로 보임(앞자리 0 또는 열 이름) → 글자로 둘 것"}
+_DATE_SHAPE = re.compile(r"^\d{4}\s*[-/.]\s*\d{1,2}\s*[-/.]\s*\d{1,2}")
+_CODE_NAME = ("번호", "코드", "전화", "우편", "id", "no")
+_DATE_NAME = ("일자", "날짜", "date", "일시")
+
+
+def diagnose(session):
+    """표를 내 PC 에서 훑어 '손볼 곳'을 센다. 칸의 값은 담지 않고 개수와 판단만 돌려준다.
+    {"columns": {열: {"kind", "empty", "spaces", "looks", "unreadable"}}, "duplicates": 겹친 행 수, "spaces": 앞뒤 빈칸 칸 수}
+    looks: "number"(글자인데 모두 숫자로 읽힘) · "date" · "code"(숫자 모양이지만 번호 · 코드) · None"""
+    s = session
+    report = {"columns": {}, "spaces": 0}
+    for ci, col in enumerate(s.columns):
+        filled = [row[ci] for row in s.rows.values() if not ed.is_empty(row[ci])]
+        info = {"kind": col.kind, "empty": len(s.rows) - len(filled), "spaces": 0, "looks": None, "unreadable": 0}
+        if col.kind == "str" and filled:
+            info["spaces"] = sum(1 for v in filled if isinstance(v, str) and v != v.strip())
+            texts = [str(v).strip() for v in filled]
+            numbers = sum(1 for x in texts if ed.as_number(x) not in (None, ed.FAIL))
+            dates = sum(1 for x in texts if ed.as_date(x) not in (None, ed.FAIL))
+            low = col.name.lower()
+            date_named = col.name.endswith("일") or any(w in low for w in _DATE_NAME)
+            if dates == len(texts) and (date_named or any(_DATE_SHAPE.match(x) for x in texts)):
+                info["looks"] = "date"
+            elif numbers == len(texts):
+                zero = any(len(x) > 1 and x[0] == "0" and x.isdigit() for x in texts)
+                info["looks"] = "code" if zero or any(w in low for w in _CODE_NAME) else "number"
+            elif numbers >= 0.9 * len(texts):
+                info["looks"], info["unreadable"] = "number?", len(texts) - numbers
+            elif dates >= 0.9 * len(texts) and date_named:
+                info["looks"], info["unreadable"] = "date?", len(texts) - dates
+        report["spaces"] += info["spaces"]
+        report["columns"][col.name] = info
+    seen = set()
+    for row in s.rows.values():                      # 앞뒤 빈칸을 지웠다고 치고 겹친 행을 센다
+        seen.add(tuple("" if ed.is_empty(v) else ed.to_text(v).strip() for v in row))
+    report["duplicates"] = len(s.rows) - len(seen)
+    return report
+
+
+def suggest(session):
+    """AI 없이, 진단만으로 만드는 '기본 전처리' 명령들과 덧붙이는 말. (명령 목록, 말 목록)"""
+    d = diagnose(session)
+    actions, notes = [], []
+    if d["spaces"]:
+        actions.append({"op": "strip"})
+    if d["duplicates"]:
+        actions.append({"op": "drop_duplicates"})
+    numeric = []
+    for name, info in d["columns"].items():
+        if info["looks"] in ("number", "date"):
+            actions.append({"op": "convert", "column": name, "kind": info["looks"]})
+        if info["looks"] == "number" or info["kind"] in ("int", "float"):
+            numeric.append(name)
+        if info["looks"] in ("number?", "date?"):
+            word = "숫자" if info["looks"] == "number?" else "날짜"
+            notes.append(f"[{name}] 은 대부분 {word}로 읽히지만 {info['unreadable']:,}칸이 읽히지 않아 그대로 두었습니다. 그 칸을 먼저 고치세요.")
+        if info["looks"] == "code":
+            notes.append(f"[{name}] 은 번호 · 코드로 보여 글자로 두었습니다.")
+    for name in numeric:
+        if d["columns"][name]["empty"]:
+            actions.append({"op": "fill_empty", "column": name, "how": "median"})
+    for name, info in d["columns"].items():
+        if info["empty"] and name not in numeric:
+            notes.append(f"[{name}] 의 빈칸 {info['empty']:,}칸은 채우지 않았습니다(숫자가 아니라 지어낼 값이 없음). "
+                         "필요하면 '가장 흔한 값으로 채워 줘' 또는 '빈칸 있는 행 지워 줘'라고 하세요.")
+    return actions, notes
+
+
 def describe(session, table, samples=0):
-    """표의 모양을 글로 적는다. samples 가 0 이면 칸의 값은 한 글자도 넣지 않는다."""
-    lines = [f"표 이름: {table}", f"행 수: {len(session.rows):,}", "열 (이름 | 종류 | 빈칸 수):"]
+    """표의 모양을 글로 적는다. samples 가 0 이면 칸의 값은 한 글자도 넣지 않는다 (진단은 개수와 판단뿐이다)."""
+    d = diagnose(session)
+    lines = [f"표 이름: {table}", f"행 수: {len(session.rows):,}",
+             f"진단: 겹친 행 {d['duplicates']:,}개(앞뒤 빈칸을 지운 뒤 기준) · 앞뒤 빈칸이 있는 칸 {d['spaces']:,}개",
+             "열 (이름 | 종류 | 빈칸 수 | 진단):"]
     for name in session.names:
         info = session.column_summary(name)
+        look = d["columns"][name]
         line = f"- {name} | {ed.KIND_NAME[info['kind']]} | 빈칸 {info['empty']:,}"
+        hints = []
+        if look["looks"] in LOOKS:
+            hints.append(LOOKS[look["looks"]])
+        elif look["looks"]:
+            word = "숫자" if look["looks"] == "number?" else "날짜"
+            hints.append(f"대부분 {word}로 읽히나 {look['unreadable']:,}칸은 읽히지 않음")
+        if look["spaces"]:
+            hints.append(f"앞뒤 빈칸 {look['spaces']:,}칸")
+        if hints:
+            line += " | 진단: " + ", ".join(hints)
         if samples:
             line += " | 값 예시: " + ", ".join(info["examples"][:4])
         lines.append(line)
@@ -66,8 +152,8 @@ def system_prompt(session, table, samples=0):
 
 [답하는 형식] 반드시 아래 모양의 JSON 객체 하나만 답한다. 다른 글이나 코드 울타리를 붙이지 않는다.
 {{"reply": "사용자에게 하는 말 (한두 문장, 우리말)", "actions": [명령, 명령, ...]}}
-- 할 일이 없거나 되물어야 하면 "actions" 를 빈 배열로 두고 "reply" 로 말한다.
-- 열 이름은 위 목록에 있는 것을 글자 그대로 쓴다. 없는 열을 지어내지 않는다. 사용자가 말한 열이 애매하면 되묻는다.
+- 할 일이 없으면 "actions" 를 빈 배열로 두고 "reply" 로 말한다. 되묻는 것은 정말 정할 수 없을 때만 한다.
+- 열 이름은 위 목록에 있는 것을 글자 그대로 쓴다. 없는 열을 지어내지 않는다.
 
 [명령] "op" 로 종류를 정한다.
 - {{"op": "set", "column": 열, "value": 값, "where": [조건...]}}  조건에 맞는 행의 그 열을 값으로 바꾼다 (값이 null 이면 비운다)
@@ -89,6 +175,13 @@ def system_prompt(session, table, samples=0):
 
 [조건] {{"column": 열, "is": 비교, "value": 값}} 의 배열. 모두 맞아야 한다. 하나만 맞아도 되게 하려면 명령에 "match": "any" 를 넣는다.
 비교: "=", "!=", ">", ">=", "<", "<=", "contains"(포함), "starts"(시작), "ends"(끝), "empty"(빈칸), "not_empty", "in"(value 가 배열)
+
+[막연한 요청] "전처리 해 줘", "정제해 줘", "정리해 줘", "널값(결측치) 처리해 줘", "숫자로 바꿔 줘" 처럼 무엇을 · 어느 열에 할지 다 말하지 않아도 되묻지 말고, 위 [지금 열려 있는 표]의 진단을 보고 바로 명령을 만든다. 사용자는 실행 전에 미리 보기를 확인하고 되돌릴 수도 있으니 합리적인 기본값으로 정하면 된다.
+- 기본 전처리 순서: ① 앞뒤 빈칸이 있으면 strip ② 겹친 행이 있으면 drop_duplicates ③ 진단이 "숫자로 바꿀 수 있음"인 열은 convert number, "날짜로 바꿀 수 있음"인 열은 convert date ④ 숫자 열(바꾼 열 포함)의 빈칸은 fill_empty median
+- "번호 · 코드로 보임"인 열은 숫자로 바꾸지 않는다. "n칸은 읽히지 않음"인 열은 바꾸지 말고 reply 에서 알려 준다.
+- 글자 열의 빈칸은 지어내지 않는다. 사용자가 "널값 제거"처럼 지우라고 했으면 drop_empty_rows, 채우라고만 했으면 숫자 열은 median · 글자 열은 mode 를 쓴다.
+- 열을 말하지 않았으면 진단에 해당하는 열 모두에 적용한다. 무엇을 기본값으로 골랐는지 reply 에 한두 문장으로 적는다.
+- 진단에 손볼 곳이 하나도 없을 때만 "actions" 를 비우고 "손볼 곳이 없습니다"라고 답한다.
 
 [주의]
 - "평균이 얼마야?" 처럼 값을 묻는 말에는 스스로 답을 지어내지 말고 stats 명령을 만든다.

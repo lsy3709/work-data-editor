@@ -528,8 +528,31 @@ check(aw.key_entry.get() == "mock-key-1234" and app.ai_state["keys"]["custom"] =
 leaked = [p.name for p in list(HERE.glob("*")) + list(AI_DIR.glob("*")) if p.is_file() and p.suffix in (".json", ".ini", ".cfg", ".env", ".txt")
           and "mock-key-1234" in p.read_text(encoding="utf-8", errors="ignore")]
 check(not leaked, "키를 어떤 파일에도 쓰지 않음")
+check(not aw.suggest() and aw.pending is None, "[전처리 제안]: 깨끗한 표에는 손볼 곳이 없다고 알려 줌")
 aw.close()
 check(aw not in ai_pane.windows and app.close_pane(ai_pane, ask=False), "AI 창 닫기 · 탭 닫기")
+
+shutil.copy2(HERE / "samples_original" / "주택연금_가입현황_정제전.xlsx", AI_DIR / "주택연금_가입현황_정제전.xlsx")
+check(open_file(AI_DIR / "주택연금_가입현황_정제전.xlsx"), "정제 전 표 열기 (금액 · 날짜가 글자, 62행)")
+raw_pane = app.current
+sw = raw_pane.open_ai()
+sw.quiet = True
+payload = sw.show_payload()
+check("숫자로 바꿀 수 있음" in payload and "겹친 행 2개" in payload and "RM26-0001" not in payload,
+      "AI 에게 진단(무엇을 손봐야 하는지)은 가고 칸의 값은 가지 않음")
+check(sw.suggest() and sw.pending and len(sw.pending) == 6 and raw_pane.session.change_count() == 0,
+      "[전처리 제안 (AI 없이)]: 프로그램이 기본 전처리 6가지를 골라 미리 보여 줌 (표는 아직 그대로)")
+plan_text = sw.plan_box.get("1.0", "end")
+check("12칸" in plan_text and "2행" in plan_text and "중앙값" in plan_text, "미리 보기: 앞뒤 빈칸 12칸 · 겹친 행 2행 · 숫자/날짜 바꾸기 · 중앙값")
+shot(sw.win, "d4_ai_suggest.png")
+kinds = lambda: [raw_pane.session.columns[raw_pane.session.col(n)].kind for n in ("월지급액", "출생연도", "가입일")]   # noqa: E731
+check(sw.apply() and len(raw_pane.session.rows) == 60 and kinds() == ["int", "int", "date"] and raw_pane.session.empty_count("월지급액") == 0
+      and len(raw_pane.tree.get_children()) == 60, "[적용] → 60행, 숫자 · 날짜로 바뀌고 빈칸이 채워짐 (표 화면도 60행)")
+check(not sw.suggest(), "한 번 하고 나면 더 손볼 곳이 없다고 알려 줌")
+check(sw.undo() and len(raw_pane.session.rows) == 62 and kinds() == ["str", "str", "str"] and raw_pane.session.change_count() == 0,
+      "[되돌리기] 한 번으로 62행 · 글자 열로 돌아감")
+sw.close()
+app.close_pane(raw_pane, ask=False)
 
 # 없는 파일 · 탭 닫기
 check(app.open_path(DATA / "없는파일.xlsx") is None, "없는 파일은 탭을 만들지 않음")
@@ -538,7 +561,11 @@ check(app.close_pane(pane, ask=False) and len(app.panes) == count - 1 and pane.c
 check(app.close_pane(first, ask=False) and first.session is None, "고친 탭도 닫으면 데이터를 놓아 줌")
 for p in list(app.panes):
     app.close_pane(p, ask=False)
-root.update()
+for _ in range(20):                                  # 화면이 다시 그려질 때까지 잠깐 기다린다 (캡처 직후에는 한 박자 늦을 수 있다)
+    root.update()
+    if app.hint.winfo_ismapped():
+        break
+    root.after(50)
 check(app.current is None and root.title() == ed.TITLE and app.hint.winfo_ismapped(), "모든 탭을 닫으면 처음 화면")
 
 root.destroy()

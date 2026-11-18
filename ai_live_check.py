@@ -70,6 +70,15 @@ def check_provider(provider, model=None):
         report(result and not result.changed and any("별" in line for line in result.lines), "집계 명령을 만들고 표는 바꾸지 않음")
         actions = ask("오늘 점심 메뉴 추천해 줘")
         report(actions == [], "표와 상관없는 말에는 명령을 만들지 않음")
+
+        shutil.copy2(HERE / "samples_original" / "주택연금_가입현황_정제전.xlsx", work / "정제전.xlsx")
+        raw_source = ed.open_source(work / "정제전.xlsx")
+        s, table = raw_source.load(raw_source.tables()[0]), raw_source.tables()[0]       # 여기부터는 금액 · 날짜가 글자로 적힌 표
+        history.clear()
+        actions = ask("전처리 해 줘")
+        result = ac.run(s, actions) if actions else None
+        report(result and result.changed and len(s.rows) == 60 and s.columns[s.col("월지급액")].kind in ("int", "float"),
+               "'전처리 해 줘'만으로 되묻지 않고 계획을 세움 (겹친 행 삭제 → 60행, 월지급액이 숫자)")
     except ai_client.AIError as e:
         print("     FAIL AI 호출 오류:", str(e).replace(key, "***"))
         ok = False
