@@ -309,6 +309,119 @@ if have_ml:
     shot(pw.win, "b4_pension_summary.png")
     check(app.close_pane(pension, ask=False), "분석한 탭 닫기")
 
+# ---------------- 복사본 만들기 · 전처리 · 다른 이름으로 저장 ----------------
+PRE = OUT / "pre"
+PRE.mkdir()
+for name in ("주택연금_가입현황_정제전.xlsx", "주택_감정가_분석연습.xlsx", "업무DB.accdb"):
+    shutil.copy2(HERE / "samples_original" / name, PRE / name)
+raw = PRE / "주택연금_가입현황_정제전.xlsx"
+before_bytes = raw.read_bytes()
+check(open_file(raw), "전처리할 표 열기 — 숫자 · 날짜가 모두 글자로 적힌 주택연금 표 (62행)")
+origin = app.current
+tabs = len(app.panes)
+copy = app.duplicate(ask=False)
+app.wait_idle()
+root.update()
+check(copy is not None and copy.source.path.name == "주택연금_가입현황_정제전_복사본.xlsx" and copy.source.path.exists()
+      and len(app.panes) == tabs + 1 and app.current is copy and len(copy.session.rows) == 62,
+      "[복사본 만들기] 원본 옆에 _복사본 파일을 만들어 새 탭으로 열기")
+w = copy.open_preprocess()
+w.quiet = True
+root.update()
+check(w is not None and copy.open_preprocess() is w, "[전처리] 창 열기 (같은 탭에서 다시 누르면 같은 창)")
+check(all(copy.session.column_summary(n)["kind"] == "str" for n in copy.session.names), "처음에는 모든 열이 글자")
+w.select_empty()
+check(set(w.selected()) == {"가입일", "월지급액", "관할지점"}, "[빈칸 있는 열 고르기] 빈칸이 있는 열 3개가 골라짐")
+shot(w.win, "c1_preprocess_before.png")
+
+w.select([])
+check(w.strip() and copy.session.get(copy.session.ids()[0], "성명") == "장재훈", "앞뒤 빈칸 지우기 (' 장재훈 ' → '장재훈')")
+check(w.drop_duplicates() and len(copy.session.rows) == 60 and len(copy.tree.get_children()) == 60, "겹친 행 삭제 → 60행, 표 화면도 60행")
+w.select(["월지급액", "출생연도"])
+check(w.convert("number") and copy.session.columns[copy.session.col("월지급액")].kind == "int"
+      and copy.session.get(copy.session.ids()[1], "월지급액") == 2430000,
+      "종류 바꾸기: 글자 → 숫자 ('2,430,000원' → 2430000), 두 열을 한 번에")
+check(str(copy.tree.column("c5", "anchor")) == "e", "숫자가 된 열은 표에서 오른쪽 맞춤으로 바뀜")
+w.select(["가입일"])
+check(w.convert("date") and copy.session.columns[copy.session.col("가입일")].kind == "date", "종류 바꾸기: 글자 → 날짜 ('2026/07/15' · '2026.01.03' 섞인 표기)")
+w.select(["관할지점"])
+check(not w.fill("mean") and "숫자 열이 아니어서" in w.last_error, "글자 열을 평균으로 채우려 하면 이유를 알려 주고 아무것도 바꾸지 않음")
+check(w.fill("mode") and copy.session.empty_count("관할지점") == 0, "글자 열 빈칸은 가장 흔한 값으로")
+w.select(["월지급액"])
+check(w.fill("median") and copy.session.empty_count("월지급액") == 0, "숫자 열 빈칸은 중앙값으로")
+check(w.scale(divide=True, factor=10000) and copy.session.get(copy.session.ids()[1], "월지급액") == 243, "숫자 계산: 10000 으로 나누기 (원 → 만원)")
+check(w.rename("월지급액(만원)") and "월지급액(만원)" in copy.session.names and copy.tree.heading("c5", "text").startswith("월지급액(만원)"),
+      "열 이름 바꾸기 — 표 머리글도 바뀜")
+w.select(["가입일"])
+check(w.drop_empty() and len(copy.session.rows) == 59, "빈칸 있는 행 삭제 (가입일이 빈 1행) → 59행")
+w.select(["출생연도"])
+check(w.add_column("확인", "str", "미확인") and copy.session.names.index("확인") == 3 and len(copy.tree["columns"]) == 8, "열 추가 (고른 열 바로 뒤) → 8열")
+w.select(["가입번호"])
+check(w.delete_columns() and "가입번호" not in copy.session.names and len(copy.tree["columns"]) == 7, "고른 열 삭제 → 7열")
+check(w.undo() and copy.session.names[0] == "가입번호" and len(copy.tree["columns"]) == 8, "[되돌리기] 지운 열이 값과 함께 돌아옴")
+check(copy.session.structure_changed and "저장 안 한 변경" in copy.status.cget("text"), "상태 줄에 저장 안 한 변경이 표시됨")
+w.select(["월지급액(만원)", "출생연도", "가입일"])
+shot(w.win, "c2_preprocess_after.png")
+shot(root, "c3_preprocess_table.png")
+
+clean = PRE / "주택연금_정리본.xlsx"
+check(copy.save_as(clean, ask=False) and app.wait_idle() and clean.exists(), "[다른 이름으로 저장] 정리한 표를 새 파일에")
+root.update()
+check(copy.source.path == clean and "주택연금_정리본.xlsx" in copy.file_label.cget("text") and not copy.is_dirty()
+      and copy.session.names == ["가입번호", "성명", "출생연도", "확인", "가입일", "지급방식", "월지급액(만원)", "관할지점"]
+      and len(copy.session.rows) == 59, "저장한 뒤 탭이 새 파일을 가리키고, 다시 읽은 표가 고친 그대로 (8열 · 59행)")
+kinds = {n: copy.session.column_summary(n)["kind"] for n in copy.session.names}
+check(kinds["월지급액(만원)"] in ("int", "float") and kinds["출생연도"] == "int" and kinds["가입일"] == "date",
+      f"다시 읽어도 숫자 · 날짜로 읽힘 ({kinds['월지급액(만원)']} · {kinds['출생연도']} · {kinds['가입일']})")
+check(raw.read_bytes() == before_bytes and not (PRE / "백업").exists(), "원본 파일은 한 글자도 바뀌지 않음 (백업 폴더도 만들지 않음)")
+check("주택연금 정리본" not in w.win.title() and "주택연금_정리본.xlsx" in w.win.title(), "전처리 창 제목도 새 파일 이름으로")
+other = PRE / "주택연금_가입현황_정제전_복사본.xlsx"
+check(origin.save_as(other, ask=False) and app.wait_idle() and origin.source.path == other, "바뀐 것이 없는 표도 다른 이름으로 저장 가능 (다른 탭이 쓰지 않는 파일 이름)")
+check(not origin.save_as(clean, ask=False), "다른 탭에서 열어 둔 파일 이름으로는 저장하지 않음")
+w.close()
+check(w not in copy.windows, "전처리 창 닫기")
+
+check(open_file(PRE / "주택_감정가_분석연습.xlsx"), "숫자 표(주택 감정가 604행) 열기")
+house = app.current
+hw = house.open_preprocess()
+hw.quiet = True
+hw.select_empty()
+check(hw.fill("mean") and all(house.session.empty_count(n) == 0 for n in house.session.names)
+      and house.session.columns[house.session.col("건축연수(년)")].kind == "float",
+      "빈칸 있는 열 3개를 평균으로 한 번에 채움 (정수 열이 소수 평균으로 채워지면 실수 열이 됨)")
+check(hw.undo() and house.session.empty_count("건축연수(년)") == 10 and house.session.change_count() == 0
+      and house.session.columns[house.session.col("건축연수(년)")].kind == "int",
+      "여러 열에 한 일도 [되돌리기] 한 번으로 모두 되돌아감")
+check(hw.fill("median") and hw.drop_duplicates() and len(house.session.rows) == 600, "중앙값으로 채우고 겹친 행 4개 삭제 → 600행")
+shot(hw.win, "c4_preprocess_numbers.png")
+backup = save_now()
+check(backup is not None and backup.exists() and not house.is_dirty() and len(house.session.rows) == 600, "[저장] 원본 엑셀에 저장 (백업 만들고 600행)")
+hw.close()
+
+if not have:
+    print("SKIP Access 표를 엑셀로 저장 (pyodbc 없음)")
+else:
+    check(open_file(PRE / "업무DB.accdb"), "Access 표 열기 (전처리용 사본)")
+    if app.current.source.needs_key:
+        acc = app.current
+        aw = acc.open_preprocess()
+        aw.quiet = True
+        col1 = acc.session.names[1]
+        aw.select([col1])
+        check(aw.rename(col1 + "_새이름") and acc.session.structure_changed, "Access 표의 열 이름 바꾸기")
+        check(not acc.save(ask=False), "열 구조를 바꾼 Access 표는 [저장]을 막고 다른 이름으로 저장을 안내")
+        out = PRE / "신청내역_정리.xlsx"
+        check(acc.save_as(out, ask=False) and app.wait_idle() and out.exists() and acc.source.path == out
+              and acc.session.names[1] == col1 + "_새이름" and not acc.source.needs_key,
+              "Access 표를 [다른 이름으로 저장] → 엑셀 파일, 탭이 그 엑셀을 가리킴")
+        root.update()
+        check(not acc.key_box.winfo_ismapped() and acc.table_label.cget("text") == "시트", "엑셀이 되었으니 '기준 열' 상자가 사라짐")
+        aw.close()
+        app.close_pane(acc, ask=False)
+for p in (house, copy, origin):
+    app.close_pane(p, ask=False)
+shot(root, "c5_toolbar.png")
+
 # 없는 파일 · 탭 닫기
 check(app.open_path(DATA / "없는파일.xlsx") is None, "없는 파일은 탭을 만들지 않음")
 count = len(app.panes)

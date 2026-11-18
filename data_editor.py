@@ -17,6 +17,7 @@
   6. TablePane      : 탭 하나 — 파일 하나를 열어 고치는 화면 (tkinter)
   7. App            : 창 — 탭 여러 개를 담는다
 회귀 분석(머신러닝)은 analysis.py(계산) · analysis_window.py(화면)에 따로 있고, [회귀 분석] 단추로 엽니다.
+전처리(빈칸 채우기 · 종류 바꾸기 · 열 고치기)는 EditSession 의 '전처리' 부분이 계산하고, 화면은 preprocess_window.py 입니다.
 모든 저장은 원본 옆 '백업' 폴더에 복사본을 먼저 만든 뒤에 합니다.
 """
 import datetime as dt
@@ -24,10 +25,11 @@ import gc
 import queue
 import re
 import shutil
+import statistics
 import sys
 import threading
 import time
-from collections import deque
+from collections import Counter, deque
 from copy import copy
 from dataclasses import dataclass
 from decimal import Decimal
@@ -119,6 +121,52 @@ def parse_text(text, column):
     return t
 
 
+_UNIT = re.compile(r"\s*(원|%)$")
+_NUM = re.compile(r"^[-+]?\d[\d,]*(\.\d+)?$")
+FAIL = object()                  # '바꿀 수 없음' 표시
+
+
+def is_empty(v):
+    return v is None or (isinstance(v, str) and v.strip() == "")
+
+
+def as_number(v):
+    """값을 숫자로. '2,430,000원' · ' 1,140,000 ' · '12%' 같은 글자도 읽는다. 못 읽으면 FAIL."""
+    if is_empty(v):
+        return None
+    if isinstance(v, bool):
+        return int(v)
+    if isinstance(v, (int, float)):
+        return v
+    if isinstance(v, Decimal):
+        return float(v)
+    if not isinstance(v, str):
+        return FAIL
+    text = _UNIT.sub("", v.strip()).replace(" ", "")
+    if not _NUM.match(text):
+        return FAIL
+    num = float(text.replace(",", ""))
+    return int(num) if num.is_integer() else num
+
+
+def as_date(v):
+    """값을 날짜로. '2026/07/15' · '2026.01.03' · '20260613' 처럼 표기가 섞여 있어도 읽는다. 못 읽으면 FAIL."""
+    if is_empty(v):
+        return None
+    if isinstance(v, dt.datetime):
+        return v
+    if isinstance(v, dt.date):
+        return dt.datetime(v.year, v.month, v.day)
+    m = _DATE.match(str(v).strip())
+    if not m:
+        return FAIL
+    try:
+        y, mo, d, h, mi, s = (int(x) if x else 0 for x in m.groups())
+        return dt.datetime(y, mo, d, h, mi, s)
+    except ValueError:
+        return FAIL
+
+
 def share_text(row, pool):
     """한 줄을 목록으로 만들되, 같은 글자는 하나만 두고 함께 쓴다 (pool = 지금까지 나온 글자들).
     '승인'·'보금자리론' 처럼 같은 글자가 수만 번 나오는 표에서 메모리가 크게 준다."""
@@ -152,6 +200,7 @@ class EditSession:
         self._orig = {}                                           # 손댄 행의 처음 모습: rid → 값 튜플
         self._next = self._n0
         self._undo = deque(maxlen=UNDO_LIMIT)                     # 되돌리기용 기록
+        self._structure = 0                                       # 열 구조(이름 · 추가 · 삭제)를 바꾼 횟수
 
     # ---- 읽기 ----
     def ids(self):
@@ -262,6 +311,19 @@ class EditSession:
                 self.rows[rid][ci] = old
             elif op[0] == "del":
                 del self.rows[op[1]]
+            elif op[0] == "kind":                     # 열 종류를 바꿨던 것
+                _, ci, kind, as_datetime = op
+                self.columns[ci].kind, self.columns[ci].as_datetime = kind, as_datetime
+            elif op[0] == "rename":
+                self.columns[op[1]].name = op[2]
+                self._restructured(-1)
+            elif op[0] == "addcol":
+                self._take_column(op[1])
+                self._restructured(-1)
+            elif op[0] == "delcols":
+                for ci, column, values, originals in reversed(op[1]):
+                    self._put_column(ci, column, values, originals)
+                self._restructured(-1)
         inserts = sorted((op for op in ops if op[0] == "ins"), key=lambda op: op[2])
         if inserts:
             items = list(self.rows.items())
@@ -300,7 +362,7 @@ class EditSession:
 
     def change_count(self):
         d = self.diff()
-        return len(d["added"]) + len(d["deleted"]) + len(d["updated"])
+        return len(d["added"]) + len(d["deleted"]) + len(d["updated"]) + self._structure
 
     def status(self, rid):
         if rid >= self._n0:
@@ -320,7 +382,250 @@ class EditSession:
             lines.append("추가  " + " | ".join(to_text(v) for v in self.rows[rid]))
         for rid in d["deleted"]:
             lines.append("삭제  " + " | ".join(to_text(v) for v in self._orig[rid]))
+        if self._structure:
+            lines.insert(0, f"열 구조를 {self._structure}번 바꿨습니다 (이름 바꾸기 · 추가 · 삭제). 지금 열: " + ", ".join(self.names))
         return lines
+
+    # =================================================================
+    # 전처리 — 분석하기 좋게 표를 한꺼번에 다듬는다. 모두 [되돌리기] 한 번으로 되돌아간다.
+    # =================================================================
+    @property
+    def structure_changed(self):
+        """열 이름을 바꾸거나 열을 더하고 뺀 적이 있는가 (저장할 때 머리글부터 다시 써야 한다)."""
+        return self._structure > 0
+
+    def _restructured(self, step):
+        self._structure += step
+        self.names = [c.name for c in self.columns]
+
+    def _values(self, ci):
+        return [row[ci] for row in self.rows.values()]
+
+    def _change(self, plan, before=()):
+        """plan = [(행번호, 열번호, 옛 값, 새 값)] 을 한 번의 작업으로 적용한다. 바꾼 칸 수를 돌려준다."""
+        for rid, ci, _, new in plan:
+            self._keep(rid)
+            self.rows[rid][ci] = new
+        ops = list(before) + [("set", rid, ci, old) for rid, ci, old, _ in plan]
+        if ops:
+            self._undo.append(ops)
+        return len(plan)
+
+    def _retype(self, ci, kind, as_datetime=None):
+        """열 종류를 바꾸고, 되돌릴 때 쓸 기록을 돌려준다."""
+        col = self.columns[ci]
+        if as_datetime is None:
+            as_datetime = col.as_datetime
+        if (col.kind, col.as_datetime) == (kind, as_datetime):
+            return []
+        op = [("kind", ci, col.kind, col.as_datetime)]
+        col.kind, col.as_datetime = kind, as_datetime
+        return op
+
+    # ---- 살펴보기 ----
+    def empty_count(self, name):
+        ci = self.col(name)
+        return sum(1 for v in self._values(ci) if is_empty(v))
+
+    def column_summary(self, name):
+        """열 하나의 요약: 종류 · 행 수 · 빈칸 수 · 서로 다른 값 수 · (숫자면) 최소 · 최대 · 평균 · 중앙값 · 값 예시."""
+        ci = self.col(name)
+        values = [v for v in self._values(ci) if not is_empty(v)]
+        info = {"name": self.names[ci], "kind": self.columns[ci].kind, "count": len(self.rows),
+                "empty": len(self.rows) - len(values), "unique": len({to_text(v) for v in values}),
+                "examples": list(dict.fromkeys(to_text(v) for v in values[:50]))[:4]}
+        nums = [v for v in values if isinstance(v, (int, float)) and not isinstance(v, bool)]
+        if nums and len(nums) == len(values):
+            info.update(min=min(nums), max=max(nums), mean=sum(nums) / len(nums), median=statistics.median(nums))
+        return info
+
+    # ---- 빈칸 ----
+    def fill_empty(self, name, how="median", value=None):
+        """빈칸을 채운다. how: median(중앙값) · mean(평균) · mode(가장 흔한 값) · value(직접 넣은 값) · above(바로 윗칸 값).
+        평균 · 중앙값은 숫자 열에서만 된다. 정수 열을 소수로 채우면 열 종류가 실수로 바뀐다."""
+        ci = self.col(name)
+        col = self.columns[ci]
+        values = [v for v in self._values(ci) if not is_empty(v)]
+        before = []
+        if how in ("median", "mean"):
+            if col.kind not in ("int", "float"):
+                raise ValueError(f"[{col.name}] 은 숫자 열이 아니어서 평균 · 중앙값으로 채울 수 없습니다.\n"
+                                 "먼저 [종류 바꾸기]에서 숫자로 바꾸거나, '가장 흔한 값' · '직접 입력'을 쓰세요.")
+            if not values:
+                raise ValueError(f"[{col.name}] 에 값이 하나도 없어 계산할 수 없습니다.")
+            new = statistics.median(values) if how == "median" else sum(values) / len(values)
+            if float(new).is_integer():
+                new = int(new)
+            elif col.kind == "int":
+                before = self._retype(ci, "float")
+        elif how == "mode":
+            if not values:
+                raise ValueError(f"[{col.name}] 에 값이 하나도 없습니다.")
+            new = Counter(values).most_common(1)[0][0]
+        elif how == "value":
+            new = parse_text(value, col)
+            if new is None:
+                raise ValueError("채울 값을 입력하세요.")
+        elif how == "above":
+            plan, last = [], None
+            for rid, row in self.rows.items():
+                if is_empty(row[ci]):
+                    if last is not None:
+                        plan.append((rid, ci, row[ci], last))
+                else:
+                    last = row[ci]
+            return self._change(plan)
+        else:
+            raise ValueError(f"채우는 방법을 알 수 없습니다: {how}")
+        return self._change([(rid, ci, row[ci], new) for rid, row in self.rows.items() if is_empty(row[ci])], before)
+
+    def drop_empty_rows(self, names=None, how="any"):
+        """빈칸이 있는 행을 지운다. names 를 주면 그 열만 본다. how="all" 이면 본 열이 모두 빈 행만 지운다."""
+        cols = [self.col(n) for n in (names or self.names)]
+        test = all if how == "all" else any
+        return self.delete_rows([rid for rid, row in self.rows.items() if test(is_empty(row[ci]) for ci in cols)])
+
+    # ---- 행 · 글자 ----
+    def drop_duplicates(self, names=None):
+        """겹친 행을 지운다(먼저 나온 행을 남긴다). names 를 주면 그 열의 값만 같아도 겹친 것으로 본다."""
+        cols = [self.col(n) for n in (names or self.names)]
+        seen, extra = set(), []
+        for rid, row in self.rows.items():
+            mark = tuple("" if is_empty(row[ci]) else to_text(row[ci]) for ci in cols)
+            if mark in seen:
+                extra.append(rid)
+            else:
+                seen.add(mark)
+        return self.delete_rows(extra)
+
+    def strip_text(self, names=None):
+        """글자 앞뒤의 빈칸을 지운다(' 김하나' → '김하나'). 빈칸만 있던 칸은 빈칸으로."""
+        plan = []
+        for ci in [self.col(n) for n in (names or self.names)]:
+            for rid, row in self.rows.items():
+                v = row[ci]
+                if isinstance(v, str) and v != v.strip():
+                    plan.append((rid, ci, v, v.strip() or None))
+        return self._change(plan)
+
+    # ---- 종류 바꾸기 ----
+    def convert(self, name, kind, on_error="stop"):
+        """열의 종류를 한꺼번에 바꾼다. kind: number(숫자) · date(날짜) · str(글자) · bool(예/아니오).
+        바꿀 수 없는 값이 있으면 on_error="stop" 은 아무것도 바꾸지 않고 알려 주고, "empty" 는 그 칸을 빈칸으로 둔다.
+        (바꾼 칸 수, 못 바꾼 칸 수) 를 돌려준다."""
+        ci = self.col(name)
+        col = self.columns[ci]
+        kind = {"int": "number", "float": "number"}.get(kind, kind)
+        if kind == "bool":
+            def read(v):
+                try:
+                    return None if is_empty(v) else (v if isinstance(v, bool) else parse_text(to_text(v), Column(col.name, "bool")))
+                except ValueError:
+                    return FAIL
+        elif kind in ("number", "date", "str"):
+            read = {"number": as_number, "date": as_date, "str": lambda v: None if is_empty(v) else to_text(v)}[kind]
+        else:
+            raise ValueError(f"바꿀 종류를 알 수 없습니다: {kind}")
+        plan, failed = [], []
+        for rid, row in self.rows.items():
+            new = read(row[ci])
+            if new is FAIL:
+                failed.append(to_text(row[ci]))
+                new = None
+            if type(new) is not type(row[ci]) or new != row[ci]:
+                plan.append((rid, ci, row[ci], new))
+        if failed and on_error != "empty":
+            shown = ", ".join(f"'{v}'" for v in list(dict.fromkeys(failed))[:5])
+            raise ValueError(f"[{col.name}] 에 {KIND_NAME[kind]}(으)로 바꿀 수 없는 값이 {len(failed):,}칸 있습니다: {shown}\n"
+                             "아무것도 바꾸지 않았습니다. '못 바꾸는 값은 빈칸으로'를 켜고 다시 하거나 그 칸을 먼저 고치세요.")
+        if kind == "number":
+            done = {rid: new for rid, _, _, new in plan}
+            every = [done.get(rid, row[ci]) for rid, row in self.rows.items()]
+            new_kind = "float" if any(isinstance(v, float) for v in every) else "int"
+        else:
+            new_kind = kind
+        before = self._retype(ci, new_kind, True if kind == "date" else None)
+        return self._change(plan, before), len(failed)
+
+    def scale(self, name, factor, divide=False):
+        """숫자 열에 수를 곱한다. divide=True 면 나눈다 (원 → 만원이면 10000 으로 나누기)."""
+        ci = self.col(name)
+        col = self.columns[ci]
+        if col.kind not in ("int", "float"):
+            raise ValueError(f"[{col.name}] 은 숫자 열이 아니어서 곱할 수 없습니다. 먼저 종류를 숫자로 바꾸세요.")
+        plan = []
+        for rid, row in self.rows.items():
+            v = row[ci]
+            if not is_empty(v):
+                new = round(v / factor if divide else v * factor, 10)
+                if isinstance(new, float) and new.is_integer() and col.kind == "int":
+                    new = int(new)                   # 정수 열은 딱 떨어지면 정수로 둔다
+                if new != v:
+                    plan.append((rid, ci, v, new))
+        before = self._retype(ci, "float") if any(isinstance(new, float) for _, _, _, new in plan) else []
+        return self._change(plan, before)
+
+    # ---- 열 고치기 ----
+    def rename_column(self, name, new_name):
+        ci = self.col(name)
+        new_name = (new_name or "").strip()
+        if not new_name:
+            raise ValueError("새 열 이름을 입력하세요.")
+        if new_name == self.names[ci]:
+            return False
+        if new_name in self.names:
+            raise ValueError(f"[{new_name}] 이라는 열이 이미 있습니다.")
+        old = self.columns[ci].name
+        self.columns[ci].name = new_name
+        self._restructured(+1)
+        self._undo.append([("rename", ci, old)])
+        return True
+
+    def _take_column(self, ci):
+        """열 하나를 떼어 낸다: (열번호, 열, 행마다의 값, 손댄 행의 처음 값)."""
+        column = self.columns.pop(ci)
+        values = {rid: row.pop(ci) for rid, row in self.rows.items()}
+        originals = {rid: old[ci] for rid, old in self._orig.items()}
+        self._orig = {rid: old[:ci] + old[ci + 1:] for rid, old in self._orig.items()}
+        return ci, column, values, originals
+
+    def _put_column(self, ci, column, values, originals):
+        self.columns.insert(ci, column)
+        for rid, row in self.rows.items():
+            row.insert(ci, values.get(rid))
+        # 그 뒤에 처음 손댄 행은 originals 에 없다 → 그 열은 그동안 안 바뀌었으니 지금 값이 곧 처음 값이다
+        self._orig = {rid: old[:ci] + (originals[rid] if rid in originals else values.get(rid),) + old[ci:]
+                      for rid, old in self._orig.items()}
+
+    def delete_columns(self, names):
+        """열을 지운다 (여러 개를 한 번에)."""
+        picked = sorted({self.col(n) for n in names}, reverse=True)
+        if len(picked) >= len(self.columns):
+            raise ValueError("열을 모두 지울 수는 없습니다. 하나는 남겨 두세요.")
+        if not picked:
+            return 0
+        taken = [self._take_column(ci) for ci in picked]
+        self._restructured(+1)
+        self._undo.append([("delcols", taken)])
+        return len(taken)
+
+    def add_column(self, name, kind="str", value=None, after=None):
+        """새 열을 넣는다. value 를 주면 모든 행을 그 값으로 채운다. after 를 주면 그 열 바로 뒤에, 없으면 맨 끝에."""
+        name = (name or "").strip()
+        if not name:
+            raise ValueError("새 열 이름을 입력하세요.")
+        if name in self.names:
+            raise ValueError(f"[{name}] 이라는 열이 이미 있습니다.")
+        column = Column(name, kind, as_datetime=True)
+        filled = parse_text(value, column) if value not in (None, "") else None
+        ci = len(self.columns) if after is None else self.col(after) + 1
+        self._put_column(ci, column, {rid: filled for rid in self.rows}, {})
+        self._restructured(+1)
+        self._undo.append([("addcol", ci)])
+        return ci
+
+
+KIND_NAME = {"int": "정수", "float": "실수", "number": "숫자", "date": "날짜", "bool": "예/아니오", "str": "글자"}
 
 
 def find_key(session):
@@ -395,18 +700,30 @@ class ExcelSource:
                                   as_datetime=any(isinstance(v, dt.datetime) for v in vals) or not vals))
         return EditSession(columns, data)
 
-    def save(self, name, session, key=None):
-        """고친 표를 그 시트에 다시 쓴다. 다른 시트와 머리글 서식은 그대로 둔다. 백업 파일 경로를 돌려준다."""
+    def save(self, name, session, key=None, backup=True):
+        """고친 표를 그 시트에 다시 쓴다. 다른 시트와 머리글 서식은 그대로 둔다. 백업 파일 경로를 돌려준다.
+        열 구조(이름 · 추가 · 삭제)를 바꿨으면 머리글부터 다시 쓴다."""
         from openpyxl import load_workbook
-        backup = make_backup(self.path)
+        backup = make_backup(self.path) if backup else None
         wb = load_workbook(self.path)
         ws = wb[name]
         old_last = ws.max_row
+        if session.structure_changed:
+            old_width, width = ws.max_column, len(session.names)
+            for c, col_name in enumerate(session.names, start=1):
+                cell = ws.cell(1, c)
+                if c > old_width and c > 1:                     # 새로 생긴 머리글 칸은 왼쪽 칸 서식을 이어받는다
+                    cell._style = copy(ws.cell(1, c - 1)._style)
+                cell.value = col_name
+            if old_width > width:
+                ws.delete_cols(width + 1, old_width - width)
         data = list(session.rows.values())
         for r, row in enumerate(data, start=2):
             for c, value in enumerate(row, start=1):
                 cell = ws.cell(r, c)
                 cell.value = value
+                if cell.number_format == "@" and isinstance(value, (int, float)) and not isinstance(value, bool):
+                    cell.number_format = "General"              # '글자' 서식 칸에 숫자를 넣었으면 서식도 풀어 준다
                 if r > old_last and r > 2:                      # 새로 생긴 줄은 윗줄 서식을 이어받는다
                     cell._style = copy(ws.cell(r - 1, c)._style)
         new_last = len(data) + 1
@@ -473,8 +790,11 @@ class AccessSource:
             columns.append(Column(d[0], kind, as_datetime=d[1] is not dt.date))
         return EditSession(columns, data)
 
-    def save(self, name, session, key=None):
+    def save(self, name, session, key=None, backup=True):
         """바뀐 곳만 Access 에 반영한다. 하나라도 실패하면 전부 취소(rollback)한다."""
+        if session.structure_changed:
+            raise ValueError("열 이름을 바꾸거나 열을 더하고 뺀 것은 Access 테이블에 저장할 수 없습니다.\n"
+                             "[다른 이름으로 저장]으로 엑셀 파일에 저장하거나, [되돌리기]로 열 구조를 되돌린 뒤 저장하세요.")
         if key not in session.names:
             raise ValueError("기준 열을 고르세요. (행을 구분하는 열, 예: 신청번호)")
         ki = session.col(key)
@@ -483,7 +803,7 @@ class AccessSource:
             raise ValueError(f"[{key}] 열은 값이 비어 있거나 겹쳐서 기준 열로 쓸 수 없습니다.\n"
                              "값이 행마다 다른 열(예: 신청번호)을 고르세요.")
         d = session.diff()
-        backup = make_backup(self.path)
+        backup = make_backup(self.path) if backup else None
         con = self._connect()
         try:
             cur = con.cursor()
@@ -550,6 +870,62 @@ def open_source(path):
     if ext in (".accdb", ".mdb"):
         return AccessSource(path)
     raise ValueError("엑셀(.xlsx) 또는 Access(.accdb) 파일만 열 수 있습니다.")
+
+
+def copy_file(path):
+    """원본 옆에 '이름_복사본' 으로 복사한다(이미 있으면 _복사본2, 3 …). 만든 파일 경로를 돌려준다."""
+    path = Path(path)
+    n = 1
+    while True:
+        target = path.with_name(f"{path.stem}_복사본{'' if n == 1 else n}{path.suffix}")
+        if not target.exists():
+            shutil.copy2(path, target)
+            return target
+        n += 1
+
+
+def write_xlsx(path, session, title="Sheet1", rids=None):
+    """표 한 장을 새 엑셀 파일로 쓴다 (머리글 굵게, 첫 줄 고정)."""
+    from openpyxl import Workbook
+    from openpyxl.cell import WriteOnlyCell
+    from openpyxl.styles import Font
+    wb = Workbook(write_only=True)                   # 한 줄씩 바로 파일로 흘려 써서 메모리를 덜 쓴다
+    ws = wb.create_sheet(str(title)[:31])
+    ws.freeze_panes = "A2"
+    head = []
+    for name in session.names:
+        cell = WriteOnlyCell(ws, value=name)
+        cell.font = Font(bold=True)
+        head.append(cell)
+    ws.append(head)
+    for rid in (session.ids() if rids is None else rids):
+        ws.append(session.rows[rid])
+    try:
+        wb.save(path)
+    except PermissionError:
+        raise RuntimeError("엑셀에서 그 파일이 열려 있으면 저장할 수 없습니다. 엑셀을 닫고 다시 저장하세요.") from None
+
+
+def save_as(source, table, session, path, key=None):
+    """고친 표를 다른 파일에 저장한다. 원본은 건드리지 않는다. 새 파일을 가리키는 source 를 돌려준다.
+      · 같은 종류(엑셀 → 엑셀, Access → Access): 원본을 통째로 복사한 뒤 그 사본에 고친 내용을 저장 (다른 시트 · 테이블도 따라온다)
+      · Access → 엑셀: 지금 보는 테이블 한 장만 새 엑셀 파일로"""
+    path = Path(path)
+    excel, access = (".xlsx", ".xlsm"), (".accdb", ".mdb")
+    ext, src_ext = path.suffix.lower(), source.path.suffix.lower()
+    if path.resolve() == source.path.resolve():
+        raise ValueError("지금 열어 둔 파일과 같은 이름입니다. 그 파일에 저장하려면 [저장]을 쓰세요.")
+    if ext in excel and src_ext in access:
+        write_xlsx(path, session, table)
+        return ExcelSource(path)
+    if (ext in excel and src_ext in excel) or (ext in access and src_ext in access):
+        shutil.copy2(source.path, path)
+        new = open_source(path)
+        new.save(table, session, key=key, backup=False)
+        return new
+    if ext in access:
+        raise ValueError("엑셀 표를 Access 파일로 저장할 수는 없습니다. 엑셀(.xlsx)로 저장하세요.")
+    raise ValueError("엑셀(.xlsx) 또는 Access(.accdb) 파일 이름으로 저장하세요.")
 
 
 # =====================================================================
@@ -628,9 +1004,9 @@ class TablePane:
     def _build(self):
         top = ttk.Frame(self.frame, padding=(10, 8, 10, 2))
         top.pack(fill="x")
-        where = f"{self.source.path.parent.name} / {self.source.path.name}"     # 폴더 / 파일 (이름이 같은 파일을 구분)
-        self.file_label = ttk.Label(top, text=f"{self.source.label} · {where}", foreground="#111")
+        self.file_label = ttk.Label(top, foreground="#111")
         self.file_label.pack(side="left")
+        self._show_source()
         self.key_box = ttk.Combobox(top, state="readonly", width=16, font=FONT)
         self.key_label = ttk.Label(top, text="기준 열")
         self.table_box = ttk.Combobox(top, state="readonly", width=22, font=FONT)
@@ -676,6 +1052,10 @@ class TablePane:
         self.tree.bind("<Button-1>", self.remember_col, add="+")
         self.tree.bind("<Delete>", lambda e: self.delete_selected())
         self.cover = ttk.Label(box, justify="center", foreground="#666", font=(FONT[0], 12))
+
+    def _show_source(self):
+        where = f"{self.source.path.parent.name} / {self.source.path.name}"     # 폴더 / 파일 (이름이 같은 파일을 구분)
+        self.file_label["text"] = f"{self.source.label} · {where}"
 
     # ---------------- 파일 · 표 열기 (작업 스레드에서 읽는다) ----------------
     def set_busy(self, text, saving=False):
@@ -732,18 +1112,34 @@ class TablePane:
         self.table_box["values"] = tables
         self.table_box.set(name)
         s = self.session
-        self.find_col["values"] = [ALL] + s.names
-        self.find_col.set(ALL)
         self.find_entry.delete(0, "end")
+        self.table_label["text"] = "테이블" if self.source.needs_key else "시트"
         for w in (self.key_box, self.key_label, self.table_box, self.table_label):
             w.pack_forget()
         if self.source.needs_key:                    # Access 일 때만 '기준 열' 을 보여 준다
-            self.key_box["values"] = s.names
             self.key_box.set(find_key(s) or "")
             self.key_box.pack(side="right")
             self.key_label.pack(side="right", padx=(14, 4))
         self.table_box.pack(side="right")
         self.table_label.pack(side="right", padx=(10, 4))
+        self.setup_columns()
+        self.cover.place_forget()
+        self.sort = (None, False)
+        self.view = s.ids()
+        self.refresh()
+        for window in self.windows:                  # 열려 있는 전처리 창이 있으면 새 표로 다시 그린다
+            if hasattr(window, "reload"):
+                window.reload()
+
+    def setup_columns(self):
+        """표의 열(이름 · 폭 · 정렬)과 열 고르는 상자들을 지금 표에 맞춘다. 열 구조가 바뀌면 다시 부른다."""
+        s = self.session
+        self.find_col["values"] = [ALL] + s.names
+        if self.find_col.get() not in self.find_col["values"]:
+            self.find_col.set(ALL)
+        self.key_box["values"] = s.names
+        if self.key_box.get() not in s.names:
+            self.key_box.set(find_key(s) or "")
         ids = [f"c{i}" for i in range(len(s.columns))]
         self.tree.configure(columns=ids)
         sample = [s.rows[rid] for rid in s.ids()[:200]]
@@ -752,9 +1148,15 @@ class TablePane:
             self.tree.heading(ids[ci], text=col.name, command=lambda c=ci: self.sort_by(c))
             self.tree.column(ids[ci], width=min(max(longest * 8 + 24, 70), 280), stretch=False,
                              anchor="e" if col.kind in ("int", "float") else "w")
-        self.cover.place_forget()
+
+    def after_preprocess(self):
+        """전처리(행 · 열 · 종류가 한꺼번에 바뀜) 뒤에 화면을 다시 맞춘다."""
+        self.cancel_edit()
+        self.tree.delete(*self.tree.get_children())
+        self.setup_columns()
         self.sort = (None, False)
-        self.view = s.ids()
+        self.find_entry.delete(0, "end")
+        self.view = self.session.ids()               # 행이 지워지거나 되살아났을 수 있으니 전체를 다시 보여 준다
         self.refresh()
 
     def on_table_change(self, event=None):
@@ -952,8 +1354,15 @@ class TablePane:
         if not self.ready():
             return
         before = set(self.session.ids())
+        shape = [(c.name, c.kind) for c in self.session.columns]
         if self.session.undo():
-            self.view += [rid for rid in self.session.ids() if rid not in before]   # 되살아난 행만 다시 보이게
+            if shape != [(c.name, c.kind) for c in self.session.columns]:        # 열 구조 · 종류까지 되돌아갔으면 표를 새로 그린다
+                self.after_preprocess()
+                for window in self.windows:
+                    if hasattr(window, "reload"):
+                        window.reload()
+                return
+            self.view +=[rid for rid in self.session.ids() if rid not in before]   # 되살아난 행만 다시 보이게
             order = {rid: i for i, rid in enumerate(self.session.ids())}
             if self.sort[0] is None:
                 self.view.sort(key=order.get)
@@ -1032,11 +1441,17 @@ class TablePane:
             return False
         s = self.session
         d = s.diff()
-        if not (d["added"] or d["deleted"] or d["updated"]):
+        if not (d["added"] or d["deleted"] or d["updated"] or s.structure_changed):
             if ask:
                 messagebox.showinfo(TITLE, "바뀐 내용이 없습니다.")
             return False
+        if s.structure_changed and self.source.needs_key:
+            self.app.show_error("열 이름을 바꾸거나 열을 더하고 뺀 것은 Access 테이블에 저장할 수 없습니다.\n"
+                                "[다른 이름으로 저장]으로 엑셀 파일에 저장하거나, [되돌리기]로 열 구조를 되돌린 뒤 저장하세요.")
+            return False
         summary = f"수정 {len(d['updated']):,}칸 · 추가 {len(d['added']):,}행 · 삭제 {len(d['deleted']):,}행"
+        if s.structure_changed:
+            summary += " · 열 구조 변경(이름 · 추가 · 삭제)"
         if ask and not messagebox.askyesno(
                 TITLE, f"{self.source.path.name} [{self.table}] 에 저장할까요?\n\n{summary}\n\n저장 전에 '백업' 폴더에 복사본을 만듭니다."):
             return False
@@ -1079,21 +1494,7 @@ class TablePane:
             messagebox.showinfo(TITLE, f"{n:,}행을 내보냈습니다.\n{path}")
 
     def export_view(self, path):
-        from openpyxl import Workbook
-        from openpyxl.cell import WriteOnlyCell
-        from openpyxl.styles import Font
-        wb = Workbook(write_only=True)               # 한 줄씩 바로 파일로 흘려 써서 메모리를 덜 쓴다
-        ws = wb.create_sheet(str(self.table)[:31])
-        ws.freeze_panes = "A2"
-        head = []
-        for name in self.session.names:
-            cell = WriteOnlyCell(ws, value=name)
-            cell.font = Font(bold=True)
-            head.append(cell)
-        ws.append(head)
-        for rid in self.view:
-            ws.append(self.session.rows[rid])
-        wb.save(path)
+        write_xlsx(path, self.session, self.table, rids=self.view)
         return len(self.view)
 
     # ---------------- 그 밖 ----------------
@@ -1109,6 +1510,66 @@ class TablePane:
         if not self.is_dirty():
             return True
         return messagebox.askyesno(TITLE, f"{self.source.path.name} 에 저장하지 않은 변경이 있습니다. 버리고 계속할까요?")
+
+    def open_preprocess(self):
+        """이 탭의 표를 다듬는 전처리 창을 연다 (preprocess_window.py)."""
+        if not self.ready():
+            return None
+        for window in self.windows:
+            if hasattr(window, "reload") and window.win.winfo_exists():
+                window.win.lift()
+                return window
+        import preprocess_window
+        window = preprocess_window.PreprocessWindow(self)
+        self.windows.append(window)
+        return window
+
+    def save_as(self, path=None, ask=True):
+        """고친 내용을 다른 파일에 저장하고, 이 탭이 그 새 파일을 가리키게 한다. 원본은 그대로 둔다. 시작했으면 True."""
+        if self.session is None:
+            return False
+        self.commit_edit()
+        if not self.ready():
+            return False
+        source, table, s = self.source, self.table, self.session
+        if path is None:
+            types = [("엑셀", "*.xlsx")] + ([("Access", "*.accdb")] if source.needs_key and not s.structure_changed else [])
+            path = filedialog.asksaveasfilename(
+                title="다른 이름으로 저장 (원본은 그대로 둡니다)", defaultextension=".xlsx", filetypes=types,
+                initialdir=str(source.path.parent), initialfile=f"{source.path.stem}_정리.xlsx")
+            if not path:
+                return False
+        path = Path(path)
+        if path.resolve() == source.path.resolve():
+            return self.save(ask=ask)
+        if any(p is not self and p.source.path.resolve() == path.resolve() for p in self.app.panes):
+            self.app.show_error("그 파일은 다른 탭에서 열려 있습니다. 다른 이름을 쓰세요.")
+            return False
+        key = self.key_box.get() if source.needs_key else None
+
+        def work():                                  # ← 작업 스레드
+            new = save_as(source, table, s, path, key=key)
+            tables = new.tables()
+            target = table if table in tables else tables[0]
+            return new, tables, target, new.load(target)
+
+        def done(result, error):                     # ← 화면 스레드
+            if self.closed:
+                return
+            self.set_busy("")
+            if error:
+                self.app.show_error(str(error))
+                return
+            new, tables, target, session = result
+            self.source = new                        # 이제부터 이 탭은 새 파일을 고친다
+            self._show_source()
+            self.show(tables, target, session)
+            if ask:
+                messagebox.showinfo(TITLE, f"다른 이름으로 저장했습니다.\n\n{new.path}\n\n원본 파일은 그대로입니다.")
+
+        self.set_busy(f"다른 이름으로 저장하는 중…  {path.name}", saving=True)
+        self.app.run_job(work, done)
+        return True
 
     def open_analysis(self):
         """이 탭의 표로 회귀 분석 창을 연다 (analysis_window.py). 분석 라이브러리가 없으면 설치 방법을 알려 준다."""
@@ -1168,10 +1629,13 @@ class App:
         top = ttk.Frame(self.root, padding=(10, 8, 10, 4))
         top.pack(fill="x")
         ttk.Button(top, text="파일 열기", command=self.choose_file).pack(side="left")
-        ttk.Button(top, text="탭 닫기", command=self.close_pane).pack(side="left", padx=6)
-        ttk.Button(top, text="회귀 분석", command=lambda: self._on("open_analysis")).pack(side="left")
-        ttk.Label(top, foreground="#777",
-                  text="여러 파일을 한 번에 고를 수 있습니다 · Ctrl+Tab 탭 이동 · Ctrl+W 탭 닫기").pack(side="left", padx=6)
+        ttk.Button(top, text="복사본 만들기", command=self.duplicate).pack(side="left", padx=(6, 0))
+        ttk.Button(top, text="다른 이름으로 저장", command=lambda: self._on("save_as")).pack(side="left", padx=6)
+        ttk.Button(top, text="탭 닫기", command=self.close_pane).pack(side="left")
+        ttk.Separator(top, orient="vertical").pack(side="left", fill="y", padx=10, pady=2)
+        ttk.Button(top, text="전처리", command=lambda: self._on("open_preprocess")).pack(side="left")
+        ttk.Button(top, text="회귀 분석", command=lambda: self._on("open_analysis")).pack(side="left", padx=6)
+        ttk.Label(top, foreground="#777", text="Ctrl+Tab 탭 이동 · Ctrl+W 탭 닫기").pack(side="left", padx=6)
         self.job_label = ttk.Label(top, text="", foreground="#B45309")
         self.job_label.pack(side="right")
 
@@ -1243,6 +1707,21 @@ class App:
         self.hint.place_forget()
         pane.load()
         return pane
+
+    def duplicate(self, pane=None, ask=True):
+        """지금 탭의 원본 파일을 '이름_복사본' 으로 복사해 새 탭으로 연다. 복사본에서 마음 놓고 고치라는 뜻."""
+        pane = pane or self.current
+        if pane is None or pane.busy:
+            return None
+        if ask and pane.is_dirty() and not messagebox.askyesno(
+                TITLE, "저장하지 않은 변경은 복사본에 들어가지 않습니다(디스크에 있는 파일을 복사합니다).\n계속할까요?"):
+            return None
+        try:
+            target = copy_file(pane.source.path)
+        except OSError as e:
+            self.show_error(f"복사하지 못했습니다.\n\n{e}")
+            return None
+        return self.open_path(target)
 
     def close_pane(self, pane=None, ask=True):
         pane = pane or self.current
