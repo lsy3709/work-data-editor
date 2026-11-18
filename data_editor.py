@@ -16,6 +16,7 @@
   5. Jobs           : 파일 읽기·저장을 작업 스레드에서 실행 (그동안 화면이 멈추지 않음)
   6. TablePane      : 탭 하나 — 파일 하나를 열어 고치는 화면 (tkinter)
   7. App            : 창 — 탭 여러 개를 담는다
+AI 채팅(우리말로 고치기)은 ai_commands.py(명령) · ai_client.py(통신) · ai_window.py(화면)에 있고, [AI 채팅] 단추로 엽니다.
 회귀 분석(머신러닝)은 analysis.py(계산) · analysis_window.py(화면)에 따로 있고, [회귀 분석] 단추로 엽니다.
 전처리(빈칸 채우기 · 종류 바꾸기 · 열 고치기)는 EditSession 의 '전처리' 부분이 계산하고, 화면은 preprocess_window.py 입니다.
 모든 저장은 원본 옆 '백업' 폴더에 복사본을 먼저 만든 뒤에 합니다.
@@ -305,7 +306,21 @@ class EditSession:
         if not self._undo:
             return False
         ops = self._undo.pop()
-        for op in reversed(ops):
+        waiting = []                                  # 되살릴 행들 (잇달아 지운 것은 한꺼번에 제자리에 넣는다)
+
+        def put_back():
+            if waiting:
+                items = list(self.rows.items())
+                for _, rid, pos, row in sorted(waiting, key=lambda op: op[2]):
+                    items.insert(pos, (rid, row))
+                self.rows = dict(items)
+                waiting.clear()
+
+        for op in reversed(ops):                      # 한 일의 거꾸로 순서로 하나씩
+            if op[0] == "ins":
+                waiting.append(op)
+                continue
+            put_back()                                # 지운 행을 먼저 되살려야 그 행의 칸을 되돌릴 수 있다
             if op[0] == "set":
                 _, rid, ci, old = op
                 self.rows[rid][ci] = old
@@ -324,12 +339,7 @@ class EditSession:
                 for ci, column, values, originals in reversed(op[1]):
                     self._put_column(ci, column, values, originals)
                 self._restructured(-1)
-        inserts = sorted((op for op in ops if op[0] == "ins"), key=lambda op: op[2])
-        if inserts:
-            items = list(self.rows.items())
-            for _, rid, pos, row in inserts:
-                items.insert(pos, (rid, row))
-            self.rows = dict(items)
+        put_back()
         return True
 
     # ---- 찾기 ----
@@ -1524,6 +1534,19 @@ class TablePane:
         self.windows.append(window)
         return window
 
+    def open_ai(self):
+        """이 탭의 표를 우리말로 고치는 AI 채팅 창을 연다 (ai_window.py)."""
+        if not self.ready():
+            return None
+        for window in self.windows:
+            if getattr(window, "is_ai", False) and window.win.winfo_exists():
+                window.win.lift()
+                return window
+        import ai_window
+        window = ai_window.AIWindow(self)
+        self.windows.append(window)
+        return window
+
     def save_as(self, path=None, ask=True):
         """고친 내용을 다른 파일에 저장하고, 이 탭이 그 새 파일을 가리키게 한다. 원본은 그대로 둔다. 시작했으면 True."""
         if self.session is None:
@@ -1603,6 +1626,7 @@ class App:
     def __init__(self, root):
         self.root = root
         self.panes = []             # 열려 있는 탭들
+        self.ai_state = {}          # AI 채팅에서 고른 AI · 모델 · 넣은 키 (메모리에만 두고 파일에 쓰지 않는다)
         self.jobs = Jobs()
         self._polling = False
         root.title(TITLE)
@@ -1635,6 +1659,7 @@ class App:
         ttk.Separator(top, orient="vertical").pack(side="left", fill="y", padx=10, pady=2)
         ttk.Button(top, text="전처리", command=lambda: self._on("open_preprocess")).pack(side="left")
         ttk.Button(top, text="회귀 분석", command=lambda: self._on("open_analysis")).pack(side="left", padx=6)
+        ttk.Button(top, text="AI 채팅", command=lambda: self._on("open_ai")).pack(side="left")
         ttk.Label(top, foreground="#777", text="Ctrl+Tab 탭 이동 · Ctrl+W 탭 닫기").pack(side="left", padx=6)
         self.job_label = ttk.Label(top, text="", foreground="#B45309")
         self.job_label.pack(side="right")

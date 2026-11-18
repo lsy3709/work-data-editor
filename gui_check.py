@@ -422,6 +422,115 @@ for p in (house, copy, origin):
     app.close_pane(p, ask=False)
 shot(root, "c5_toolbar.png")
 
+# ---------------- AI 채팅 (가짜 AI 서버로 — 인터넷과 API 키 없이) ----------------
+import json
+import os
+
+import ai_mock_server
+
+AI_DIR = OUT / "ai"
+AI_DIR.mkdir()
+shutil.copy2(HERE / "samples_original" / "보금자리론_신청_2026_10.xlsx", AI_DIR / "보금자리론_신청_2026_10.xlsx")
+ANSWERS = {
+    "X99": {"reply": "지점코드 열의 X99 를 ON1 로 바꿉니다.",
+            "actions": [{"op": "replace", "column": "지점코드", "find": "X99", "to": "ON1", "mode": "cell"}]},
+    "재심사": {"reply": "신청금액이 3억 이상이고 반려된 건을 재심사로 바꾸고, 금액(억원) 열을 만듭니다.",
+            "actions": [{"op": "set", "column": "처리상태", "value": "재심사",
+                         "where": [{"column": "신청금액(만원)", "is": ">=", "value": 30000}, {"column": "처리상태", "is": "=", "value": "반려"}]},
+                        {"op": "compute", "target": "신청금액(억원)", "left": "신청금액(만원)", "operator": "/", "right": 10000}]},
+    "평균": {"reply": "고객구분별 평균 신청금액을 계산합니다.",
+           "actions": [{"op": "stats", "column": "신청금액(만원)", "how": "mean", "by": "고객구분"}]},
+    "보여": {"reply": "디딤돌 상품만 금액이 큰 순서로 보여 드립니다.",
+           "actions": [{"op": "show", "where": [{"column": "상품명", "is": "contains", "value": "디딤돌"}]},
+                       {"op": "sort", "column": "신청금액(만원)", "descending": True}]},
+    "없는": {"reply": "등급 열을 A 로 채웁니다.", "actions": [{"op": "set", "column": "등급", "value": "A"}]},
+    "지워": {"reply": "일반 고객 행을 지웁니다.", "actions": [{"op": "delete_rows", "where": [{"column": "고객구분", "is": "=", "value": "일반"}]}]},
+}
+
+
+def fake_ai(question):
+    for word, answer in ANSWERS.items():
+        if word in question:
+            return json.dumps(answer, ensure_ascii=False)
+    return json.dumps({"reply": "표와 관련된 일을 말씀해 주세요.", "actions": []}, ensure_ascii=False)
+
+
+def say(window, text):
+    """AI 창에 말을 보내고 답이 처리될 때까지 기다린다."""
+    sent = window.send(text)
+    app.wait_idle(60)
+    root.update()
+    return sent
+
+
+mock = ai_mock_server.start(fake_ai)
+check(open_file(AI_DIR / "보금자리론_신청_2026_10.xlsx"), "AI 로 고칠 표 열기 (보금자리론 신청 240행)")
+ai_pane = app.current
+aw = ai_pane.open_ai()
+aw.quiet = True
+root.update()
+check(aw is not None and ai_pane.open_ai() is aw, "[AI 채팅] 창 열기 (같은 탭에서 다시 누르면 같은 창)")
+check(set(aw.keys) == {"gemini", "openai", "claude", "custom"} and aw.model_box.get() != "", "AI 네 가지(Gemini · GPT · Claude · 직접 지정)와 기본 모델 이름")
+aw.choose("claude")
+check("claude-opus-5-5" in aw.model_box["values"] and not aw.url_row.winfo_ismapped(), "AI 를 바꾸면 모델 목록이 바뀜 (주소 칸은 직접 지정일 때만)")
+aw.choose("custom", model="mock-model", key="mock-key-1234", url=mock.url + "/v1")
+root.update()
+check(aw.url_row.winfo_ismapped() and aw.key_entry.cget("show") == "•", "직접 지정: 주소 칸이 보이고, 키는 화면에 가려서 표시")
+
+check(say(aw, "지점코드가 X99 인 것을 ON1 로 바꿔 줘") and aw.pending is not None, "말을 보내면 AI 가 명령을 만들어 옴")
+plan_text = aw.plan_box.get("1.0", "end")
+check("13칸" in plan_text and ai_pane.session.change_count() == 0 and str(aw.apply_button["state"]) == "normal",
+      "적용 전 미리 보기: '13칸'이라고 알려 주고 표는 아직 그대로")
+sent = mock.requests[-1]
+system_text = sent["body"]["messages"][0]["content"]
+first_id = str(ai_pane.session.rows[ai_pane.session.ids()[0]][0])
+check(all(n in system_text for n in ai_pane.session.names) and first_id not in json.dumps(sent["body"], ensure_ascii=False),
+      "AI 에게는 열 이름만 가고 칸의 값은 가지 않음")
+check(sent["headers"].get("authorization") == "Bearer mock-key-1234" and "mock-key-1234" not in json.dumps(sent["body"], ensure_ascii=False)
+      and "mock-key-1234" not in aw.show_payload(), "키는 머리말로만 보내고, '보내는 내용 보기'에도 나오지 않음")
+shot(aw.win, "d1_ai_preview.png")
+check(aw.apply() and len(ai_pane.session.search("X99", "지점코드")) == 0 and ai_pane.session.change_count() == 13
+      and str(aw.apply_button["state"]) == "disabled", "[적용] → 13칸이 바뀜")
+check(aw.undo() and ai_pane.session.change_count() == 0, "[되돌리기] → 처음 그대로")
+
+check(say(aw, "3억 이상이면서 반려된 건은 재심사로 바꾸고 억원 열도 만들어 줘") and aw.pending and len(aw.last_lines) == 2, "명령 두 개짜리 요청")
+check(aw.apply() and "신청금액(억원)" in ai_pane.session.names and len(ai_pane.tree["columns"]) == 9, "[적용] → 조건에 맞는 칸을 바꾸고 계산 열이 생김 (표 화면도 9열)")
+check("사용자가 적용했다" in aw.note, "다음 말에 '직전 명령을 적용했다'는 것을 AI 에게 알려 줌")
+check(aw.undo() and "신청금액(억원)" not in ai_pane.session.names and ai_pane.session.change_count() == 0, "명령 두 개가 [되돌리기] 한 번으로 돌아감")
+
+check(say(aw, "고객구분별 평균 신청금액을 알려 줘") and aw.pending is None and "[고객구분] 별" in aw.last_lines[0],
+      "집계는 확인 없이 바로 계산해 보여 줌 (표는 바꾸지 않음)")
+check("직전" not in mock.requests[-1]["body"]["messages"][-1]["content"] or "되돌렸다" in mock.requests[-1]["body"]["messages"][-1]["content"],
+      "집계 결과(숫자)는 AI 에게 보내지 않음")
+check(say(aw, "디딤돌만 금액 큰 순서로 보여 줘") and 0 < len(ai_pane.view) < 240 and len(ai_pane.tree.get_children()) == len(ai_pane.view)
+      and ai_pane.session.change_count() == 0, f"보기 · 정렬: 표 화면에 {len(ai_pane.view)}행만 큰 금액부터")
+shot(aw.win, "d2_ai_stats.png")
+shot(root, "d3_ai_table.png")
+
+check(say(aw, "없는 열을 채워 줘") and aw.pending is None and "등급" in aw.last_error and ai_pane.session.change_count() == 0,
+      "AI 가 없는 열을 말하면 실행하지 않고 이유를 알려 줌")
+check(say(aw, "일반 고객은 지워 줘") and aw.pending is not None and aw.discard() and len(ai_pane.session.rows) == 240 and "버렸다" in aw.note,
+      "[버리기] → 표는 그대로, AI 에게는 버렸다고 알려 줌")
+check(say(aw, "안녕") and aw.pending is None and ai_pane.session.change_count() == 0, "표와 상관없는 말에는 명령 없이 말로만 답함")
+
+aw.samples.set(True)
+check(first_id in aw.show_payload(), "'예시 값도 보내기'를 켰을 때만 앞 3행이 보내는 내용에 들어감")
+aw.samples.set(False)
+mock.stop()
+check(say(aw, "X99 를 바꿔 줘") and "연결" in aw.last_error, "AI 서버에 연결이 안 되면 우리말로 알려 줌")
+saved = os.environ.pop("OPENAI_API_KEY", None)
+aw.choose("openai")
+check(aw.key_entry.get() == "" and say(aw, "X99 를 바꿔 줘") and "API 키가 없습니다" in aw.last_error, "키를 넣지 않으면 보내지 않고 알려 줌")
+if saved:
+    os.environ["OPENAI_API_KEY"] = saved
+aw.choose("custom")
+check(aw.key_entry.get() == "mock-key-1234" and app.ai_state["keys"]["custom"] == "mock-key-1234", "AI 를 오갈 때 넣어 둔 키 · 모델을 기억 (메모리에만)")
+leaked = [p.name for p in list(HERE.glob("*")) + list(AI_DIR.glob("*")) if p.is_file() and p.suffix in (".json", ".ini", ".cfg", ".env", ".txt")
+          and "mock-key-1234" in p.read_text(encoding="utf-8", errors="ignore")]
+check(not leaked, "키를 어떤 파일에도 쓰지 않음")
+aw.close()
+check(aw not in ai_pane.windows and app.close_pane(ai_pane, ask=False), "AI 창 닫기 · 탭 닫기")
+
 # 없는 파일 · 탭 닫기
 check(app.open_path(DATA / "없는파일.xlsx") is None, "없는 파일은 탭을 만들지 않음")
 count = len(app.panes)
