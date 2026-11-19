@@ -158,7 +158,9 @@ def _post(url, headers, body, timeout):
         with urllib.request.urlopen(request, timeout=timeout) as response:
             raw = response.read()
     except urllib.error.HTTPError as e:
-        raise AIError(_status_text(e.code, _detail(e.read()))) from None
+        with e:                                         # 오류 응답도 다 읽은 뒤 닫는다 (안 닫으면 ResourceWarning)
+            raw = e.read()
+        raise AIError(_status_text(e.code, _detail(raw))) from None
     except (UnicodeError, ValueError):
         raise AIError("주소나 모델 이름에 쓸 수 없는 글자가 있습니다. 영문 주소 · 모델 이름인지 확인하세요.") from None
     except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError, OSError):

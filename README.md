@@ -920,6 +920,24 @@ ac.run(s, [{"op": "replace", "column": "지점코드", "find": "X99", "to": "ON1
 - 터미널은 Windows PowerShell 5.1 기준으로 확인했습니다. Python 3.11 · 3.12 는 직접 돌려 보지 않았습니다.
 - VS Code 화면에서 버튼을 누르는 과정(인터프리터 · 커널 선택)은 글로 적은 순서이며, 자동 점검에는 포함되지 않았습니다.
 
+**Python 3.15.2 로 다시 확인 (2026-11-19)**
+
+python.org 의 공식 압축본(`python-3.15.2-amd64.zip`)을 풀어 새 가상 환경을 만들고, 이 저장소를 새로 `git clone` 해 처음부터 설치 · 실행했습니다. 수업 자료(실습 자료 zip 의 샘플 S1 ~ S5, 학생 동선)도 같은 환경에서 돌렸습니다. **45항목 모두 통과.**
+
+| 항목 | 결과 |
+| --- | --- |
+| `pip install -r requirements.txt` | 통과 — openpyxl 3.1.5 · pandas 3.1.1 · numpy 2.5.5 · scikit-learn 1.9.1 · scipy 1.18.1 · matplotlib 3.11.2 · anthropic 2.10.0 · pyodbc 5.5.0 · ipykernel 7.4.0 |
+| 테스트 5종 (17 · 18 · 17 · 17 · 13 = 82개) | 통과 |
+| `gui_check.py` 153항목 (창 표시 Tk 9.0) | 통과 |
+| 노트북 12칸 (Access 칸 포함) | 통과 |
+| `ai_live_check.py gemini` (실제 Gemini 다섯 가지 요청) | 통과 |
+| `sample_report.py` (연습용 표 4개 분석) | 통과 |
+| `requirements-lock.txt` (3.13 에서 만든 고정 목록) `--dry-run` | 통과 |
+| 수업 샘플 S1 ~ S5 결과예시 22개와 셀 단위 대조 | 차이 0 |
+
+- 이때 찾아 고친 것: AI 서버가 오류(401 · 429 · 500 등)로 답할 때 그 응답을 닫지 않아 `ResourceWarning` 이 나던 것 (`ai_client.py`). 3.15 · 3.13 모두 경고 없이 통과합니다.
+- 그대로 둔 출력: 노트북 실행기(zmq)의 안내 문구, S5 의 pandas 안내 경고(실습지에 적힌 것), pandas 3.1 의 `select_dtypes(include="object")` 안내 경고(수업 자료의 pandas 3 차이 예제).
+
 **알아 둘 것**
 
 - 연습용 데이터는 모두 **가상 데이터**입니다. 실제 기관 · 인물 · 수치와 무관합니다.
